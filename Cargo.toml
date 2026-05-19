@@ -4,3 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "2", features = ["serde"] }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
