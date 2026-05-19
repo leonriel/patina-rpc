@@ -22,3 +22,4 @@ You are helping build **Patina**, a high-performance, asynchronous Remote Proced
 * **Test-Driven Development (TDD):** When asked to implement a new feature, write failing unit/integration tests first. Use `tokio::test` for async tests.
 * **Error Handling:** Use `thiserror` for defining custom error types. 
 * **Logging:** Use the `tracing` crate for instrumentation (`info!`, `debug!`, `error!`), not `println!`.
+* **Naming — `Envelope` bindings:** Do not use `env` as a variable name for `Envelope` values; it reads as "environment". Default to the full word `envelope`. For tight scopes where a one-letter binding is idiomatic (closures, single-line match arms), `e` is acceptable.
