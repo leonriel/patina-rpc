@@ -142,3 +142,106 @@ If you don't aggressively clean up state, your multiplexer will leak memory.
 
 * **Client Timeouts:** If a user wraps their RPC call in tokio::time::timeout and it expires, the caller drops their oneshot::Receiver. However, the ID and the oneshot::Sender are still sitting in the PendingMap\! You must implement a mechanism (often a Drop guard) to remove the ID from the map if the caller gives up.
 * **Connection Drops:** If the TCP connection unexpectedly closes, the Background Reader Task will exit. Before it shuts down, it must iterate through the entire PendingMap and send an Error to every single waiting oneshot channel. Otherwise, all pending caller threads will hang forever waiting for a response that will never arrive.
+
+# **Phase 3: Procedural Macro Design & Usage Guide**
+
+**Component:** Developer Experience / patina-macros
+
+## **1\. Overview**
+
+The \#\[patina::service\] procedural macro is designed to eliminate network boilerplate. It transforms a standard Rust asynchronous trait into a fully functional, multiplexed RPC client and a zero-allocation server dispatch router. By hooking into the Rust compiler's Abstract Syntax Tree (AST) via the syn crate, we ensure compile-time type safety across the network boundary.
+
+## **2\. Macro Implementation Design**
+
+The macro system is split across two crates to satisfy Rust's compiler requirements:
+
+1. patina-macros: A pure proc-macro \= true crate containing the AST parsing logic.  
+2. patina-rpc: The core network crate that re-exports \#\[patina::service\] for users.
+
+### **2.1. AST Parsing Phase (syn)**
+
+When the compiler encounters the macro, patina-macros takes the raw token stream and parses it into a syn::ItemTrait. The macro validates the following constraints:
+
+* The block must be a trait.  
+* Every method must be async.  
+* Every method's return type must be a Result\<T, PatinaError\>.  
+* No method can take \&mut self (RPC handlers must be stateless or manage their own interior mutability via Arc\<Mutex\<T\>\>).
+
+### **2.2. Code Generation Phase (quote)**
+
+For a trait named Service, the macro generates two distinct artifacts:
+
+| Generated Component | Naming Convention | Purpose |
+| :---- | :---- | :---- |
+| **Client Proxy** | \[TraitName\]Client | A struct holding an Arc\<PatinaClient\>. It implements identically named methods that serialize arguments via Bincode, send them over the multiplexer with the method's string name (e.g., "Service::method"), and deserialize the response. |
+| **Server Dispatcher** | dispatch\_\[trait\_name\] | An async function that takes a raw byte payload and a method name string. It acts as a massive match statement, routing the bytes to the correct method on a user-provided struct that implements the trait. |
+
+## **3\. Developer Workflow & Team Coordination**
+
+How does this actually look when you are running a multi-service engineering organization?
+
+Instead of passing .thrift files around, your teams share **API Crates**. Every microservice is split into two repositories (or two crates in a monorepo): the **API** (public) and the **Server** (private business logic).
+
+### **The "Thrift vs. Patina" Paradigm**
+
+* **Meta / Thrift Workflow:** Write service.thrift \-\> Run thrift \--gen cpp \-\> Commit generated code \-\> Team writes Hack/C++ handler.  
+* **Your Patina Workflow:** Write pub trait in a Rust API crate \-\> Run cargo build (macro generates code in memory) \-\> Team implements the trait.
+
+### **Cross-Functional Scenario: Team A needs Team B to add an endpoint**
+
+Imagine **Team A** (User Analytics) needs to query the active cache state from **Team B** (The Cache Node team). Team B's cache currently doesn't have an endpoint for this.
+
+Here is the exact lifecycle of that collaboration:
+
+#### **Step 1: The API Pull Request (Team A \-\> Team B)**
+
+Team A checks out Team B's repository. They open the cache-api crate and modify the shared Patina trait.
+
+Rust  
+// In cache-api/src/lib.rs (Owned by Team B, modified by Team A)  
+\#\[patina::service\]  
+pub trait CacheService {  
+    async fn get\_value(\&self, key: String) \-\> Result\<Option\<Vec\<u8\>\>, PatinaError\>;  
+      
+    // Team A adds this new requirement:  
+    async fn get\_active\_keys\_count(\&self) \-\> Result\<u64, PatinaError\>;   
+}
+
+Team A submits this as a Pull Request to Team B.
+
+#### **Step 2: The Server Implementation (Team B)**
+
+Team B reviews the PR and agrees it's a good feature. Because the trait in cache-api changed, Team B's cache-server crate will now **fail to compile** because their server struct no longer fully implements the CacheService trait.
+
+This is a massive benefit: the Rust compiler forces the server team to implement the new endpoint immediately.
+
+Rust  
+// In cache-server/src/main.rs (Owned and written by Team B)  
+impl CacheService for MyCache {  
+    // ... existing get\_value impl ...
+
+    // Team B implements the new requirement:  
+    async fn get\_active\_keys\_count(\&self) \-\> Result\<u64, PatinaError\> {  
+        let count \= self.internal\_map.lock().await.len() as u64;  
+        Ok(count)  
+    }  
+}
+
+Team B merges the PR, tags a new version of cache-api (e.g., v1.2.0), and deploys their updated server to the cluster.
+
+#### **Step 3: The Client Adoption (Team A)**
+
+Now that the server supports it, Team A goes back to their own repository (User Analytics). They bump the dependency version of cache-api in their Cargo.toml to v1.2.0.
+
+Because of the \#\[patina::service\] macro, CacheServiceClient magically has the new method available. Team A just calls it:
+
+Rust  
+// In user-analytics/src/main.rs (Owned by Team A)  
+let cache\_client \= CacheServiceClient::connect("cache-node:8080").await?;
+
+// The new API is ready to use with full autocomplete and type safety  
+let count \= cache\_client.get\_active\_keys\_count().await?;
+
+### **The Resulting Architecture**
+
+By relying on Cargo crates and Rust traits instead of external IDL files, you get cross-team coordination that is validated by the Rust compiler. If Team B ever deletes or changes the signature of an endpoint, Team A's code will fail at compile time (rather than crashing in production) as soon as they update their crate dependency.

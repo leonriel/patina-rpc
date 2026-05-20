@@ -1,8 +1,9 @@
 //! Error types for the wire and RPC layers.
 //!
 //! `WireError` covers byte-level concerns (framing, serialization, socket I/O).
-//! `RpcError` is the higher-level error surface exposed to RPC callers —
+//! `PatinaError` is the higher-level error surface exposed to RPC callers —
 //! transport failure, remote-reported errors, and connection lifecycle events.
+//! `RpcError` is retained as a backward-compatible alias of `PatinaError`.
 
 use crate::envelope::ErrorData;
 
@@ -33,9 +34,11 @@ pub enum WireError {
 ///
 /// Distinct from [`WireError`] so the wire layer keeps its narrow vocabulary
 /// (bytes in, bytes out) and the RPC layer surfaces higher-level concerns
-/// (remote errors, connection lifecycle, dispatch failures).
+/// (remote errors, connection lifecycle, dispatch failures). This is also the
+/// error type the `#[patina_rpc::service]` macro uses in generated trait
+/// method signatures (`Result<T, PatinaError>`).
 #[derive(Debug, thiserror::Error)]
-pub enum RpcError {
+pub enum PatinaError {
     /// Transport or codec failure (read/write/decode/encode).
     #[error("wire error: {0}")]
     Wire(#[from] WireError),
@@ -61,14 +64,27 @@ pub enum RpcError {
     UnknownMethod(String),
 }
 
-impl From<ErrorData> for RpcError {
-    fn from(e: ErrorData) -> Self {
-        RpcError::Remote { code: e.code, message: e.message }
+/// Backward-compatible alias. Phase 1–2 code referred to this type as
+/// `RpcError`; it was renamed to [`PatinaError`] in Phase 3 to match the
+/// service-macro vocabulary.
+pub type RpcError = PatinaError;
+
+impl PatinaError {
+    /// Construct an application-level failure for a handler to return. Surfaces
+    /// to the caller as [`PatinaError::Remote`] with the given code and message.
+    pub fn application(code: u16, message: impl Into<String>) -> Self {
+        PatinaError::Remote { code, message: message.into() }
     }
 }
 
-impl From<std::io::Error> for RpcError {
+impl From<ErrorData> for PatinaError {
+    fn from(e: ErrorData) -> Self {
+        PatinaError::Remote { code: e.code, message: e.message }
+    }
+}
+
+impl From<std::io::Error> for PatinaError {
     fn from(e: std::io::Error) -> Self {
-        RpcError::Wire(WireError::Io(e))
+        PatinaError::Wire(WireError::Io(e))
     }
 }

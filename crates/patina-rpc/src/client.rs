@@ -21,7 +21,7 @@
 //! connection instead of leaving a task parked forever on a half-open socket.
 //! The reader owns teardown: on exit it drains the `PendingMap`, and dropping
 //! the contained `oneshot::Sender`s causes every parked caller's `rx.await` to
-//! resolve to `Err(RecvError)`, which `call()` maps to `RpcError::Closed`.
+//! resolve to `Err(RecvError)`, which `call()` maps to `PatinaError::Closed`.
 //! `is_closed()` reports `token.is_cancelled()`.
 //!
 //! The design doc (§4 "Connection Drops") describes sending an explicit
@@ -42,7 +42,7 @@ use tracing::{debug, error, trace, warn};
 
 use crate::codec::WireCodec;
 use crate::envelope::{Envelope, RequestData};
-use crate::error::RpcError;
+use crate::error::PatinaError;
 
 /// Bound on the writer task's mpsc buffer. Backpressures callers when the
 /// socket can't drain outbound requests fast enough.
@@ -83,7 +83,7 @@ impl PendingMap {
 
     /// Remove and return every parked sender (disconnect teardown). Dropping
     /// the returned senders wakes each parked caller with `RecvError`, which
-    /// `call()` maps to `RpcError::Closed`.
+    /// `call()` maps to `PatinaError::Closed`.
     fn drain(&self) -> Vec<oneshot::Sender<Envelope>> {
         std::mem::take(&mut *self.guard()).into_values().collect()
     }
@@ -114,7 +114,7 @@ pub struct Client {
 
 impl Client {
     /// Open a TCP connection and start the background reader/writer tasks.
-    pub async fn connect(addr: impl ToSocketAddrs) -> Result<Self, RpcError> {
+    pub async fn connect(addr: impl ToSocketAddrs) -> Result<Self, PatinaError> {
         let stream = TcpStream::connect(addr).await?;
         Ok(Self::from_stream(stream))
     }
@@ -149,9 +149,9 @@ impl Client {
         &self,
         method: impl Into<String>,
         payload: Vec<u8>,
-    ) -> Result<Vec<u8>, RpcError> {
+    ) -> Result<Vec<u8>, PatinaError> {
         if self.token.is_cancelled() {
-            return Err(RpcError::Closed);
+            return Err(PatinaError::Closed);
         }
 
         // DESIGN.md §4: AtomicU64 with Relaxed is sufficient — we only need
@@ -174,19 +174,19 @@ impl Client {
         if self.outbound.send(request).await.is_err() {
             // Writer task is gone — connection effectively closed. The guard
             // stays armed and removes the now-orphaned entry on drop.
-            return Err(RpcError::Closed);
+            return Err(PatinaError::Closed);
         }
 
         let result = match rx.await {
             Ok(Envelope::Response(r)) => Ok(r.payload),
-            Ok(Envelope::Error(e)) => Err(RpcError::from(e)),
+            Ok(Envelope::Error(e)) => Err(PatinaError::from(e)),
             Ok(other) => {
                 warn!(?other, "non-response/error envelope received through oneshot");
-                Err(RpcError::Closed)
+                Err(PatinaError::Closed)
             }
             // Sender dropped without sending — reader_loop exited and drained
             // the PendingMap. Surface as a connection close.
-            Err(_) => Err(RpcError::Closed),
+            Err(_) => Err(PatinaError::Closed),
         };
 
         // `rx.await` resolved, so the reader has already removed our entry (on
@@ -205,7 +205,7 @@ impl Client {
     }
 
     /// Whether either background task has observed connection closure.
-    /// `call()` short-circuits to `RpcError::Closed` once this is true.
+    /// `call()` short-circuits to `PatinaError::Closed` once this is true.
     pub fn is_closed(&self) -> bool {
         self.token.is_cancelled()
     }
@@ -309,7 +309,7 @@ async fn reader_loop(
     // Connection died (or the writer signalled us via the token). Cancel so
     // the writer stops too, then drain the PendingMap; dropping the contained
     // senders wakes every parked caller with RecvError, which `call()` maps to
-    // RpcError::Closed. `is_closed()` observes the cancelled token.
+    // PatinaError::Closed. `is_closed()` observes the cancelled token.
     token.cancel();
     let drained = pending.drain();
     trace!(count = drained.len(), "draining pending map after disconnect");
