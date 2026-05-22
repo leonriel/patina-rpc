@@ -245,3 +245,109 @@ let count \= cache\_client.get\_active\_keys\_count().await?;
 ### **The Resulting Architecture**
 
 By relying on Cargo crates and Rust traits instead of external IDL files, you get cross-team coordination that is validated by the Rust compiler. If Team B ever deletes or changes the signature of an endpoint, Team A's code will fail at compile time (rather than crashing in production) as soon as they update their crate dependency.
+
+---
+
+## **Phase 4 (Future Direction): Streaming RPC**
+
+> **Status:** Proposed — not yet implemented. This section records the intended design so it can be picked up as a dedicated patch. Phases 1–3 do not depend on it, and the unary call path must remain the zero-overhead default.
+
+### **1\. Motivation**
+
+Phases 1–3 model every call as *unary*: one `Request` maps to exactly one `Response`, matched by `id` through a `oneshot` channel. This is simple and fast, but it forces the entire argument or return value to be serialized and deserialized in a single synchronous step.
+
+`bincode` (de)serialization is CPU-bound and runs *inline* on the calling Tokio task — it is not an `.await` point. For small control-plane payloads (keys, metadata, small values) this costs microseconds and is irrelevant. For large payloads (multi-megabyte values, range-scan results), a single `encode`/`decode` can occupy a worker thread for milliseconds to tens of milliseconds. Because Tokio's scheduler is cooperative, that worker cannot poll any other task until the call returns — degrading tail latency and, under concurrency, starving the I/O reader/writer loops. The 64 MB frame cap (Phase 1 §5.1) is the worst-case ceiling, and CopperDB — a storage engine that may return large values — makes this a realistic concern rather than a theoretical one.
+
+There is a second, structural cost: each connection has exactly **one** writer task. A single large outbound frame monopolizes that writer while it serializes and flushes, head-of-line-blocking every other response multiplexed onto the same connection.
+
+The fix is to stop treating a large transfer as one object. A streaming call carries a *sequence of bounded chunks*, each its own frame, with `.await` points between chunks. Per-chunk (de)serialization stays small, the worker yields between chunks, and neither peer ever holds the whole object in memory.
+
+### **2\. Wire Protocol Extensions**
+
+Streaming introduces new `Envelope` variants, all keyed by the existing `u64` request `id`:
+
+```rust
+enum Envelope {
+    // Phase 1 variants, unchanged:
+    Request(RequestData), Response(ResponseData), Error(ErrorData), Heartbeat,
+
+    // Streaming additions:
+    StreamItem { id: u64, payload: Vec<u8> }, // one bounded chunk
+    StreamEnd { id: u64 },                     // clean termination
+    StreamError(ErrorData),                    // mid-stream failure
+    StreamCancel { id: u64 },                  // consumer asked to stop
+    StreamCredit { id: u64, items: u32 },      // flow-control window (see §4)
+}
+```
+
+Two rules preserve compatibility and bounds:
+
+* **Append-only evolution.** New variants are added *after* the existing ones so their `bincode` discriminants do not shift. Peers stay wire-compatible for the message types they share.
+* **One chunk, one frame.** Each `StreamItem` is a single length-delimited frame, so the 64 MB cap applies *per chunk*. Producers chunk deliberately small (e.g., 16–64 KiB); a giant object is never handed to `bincode` whole.
+
+### **3\. Multiplexer Extensions**
+
+The pending-request registry currently stores a single-fire `oneshot::Sender` per `id`. Streaming generalizes the stored value to a sum type:
+
+```rust
+enum Pending {
+    Unary(oneshot::Sender<Envelope>),                   // fires once (Phases 1–3)
+    Stream(mpsc::Sender<Result<Vec<u8>, PatinaError>>), // many bounded chunks
+}
+```
+
+The background reader routes by frame type:
+
+* `Response` / `Error` → fire the `Unary` `oneshot` (today's path).
+* `StreamItem` → push the chunk onto the `Stream` `mpsc`.
+* `StreamEnd` → drop the sender, ending the consumer's stream.
+* `StreamError` → forward the error, then end the stream.
+
+Because frames for a given `id` arrive in TCP order on a single connection, per-stream ordering is preserved with no reassembly logic. The client's streaming call returns an `impl Stream<Item = Result<T, PatinaError>>` backed by the receiving end of the `mpsc`, with `decode` mapped over each chunk. Disconnect cleanup is the existing pending-map drain extended to also drop `Stream` senders, which ends every live stream with `Closed`.
+
+### **4\. Flow Control**
+
+Because many logical streams share one TCP connection and one writer task, **TCP backpressure alone is insufficient**: a slow consumer of one stream would stall the shared writer and head-of-line-block every other stream. Patina therefore needs **per-stream, credit-based flow control**, modeled on HTTP/2 windows:
+
+* The consumer grants the producer credits via `StreamCredit { id, items }`, indicating how many further chunks it is ready to accept.
+* The server's producer `.await`s for available credit before emitting the next `StreamItem`.
+* A backed-up stream simply stops being granted credit and idles, without touching the writer task or any sibling stream.
+
+TCP backpressure still acts as the outer envelope; credits provide the per-stream fairness a shared connection cannot get from TCP alone. This is the most subtle part of the design and should be treated as its own implementation step.
+
+### **5\. Macro & Trait Surface**
+
+A streaming method is distinguished by its return type — a dedicated wrapper the macro can pattern-match (analogous to how it already matches `Result<T, PatinaError>`), rather than overloading a bare `impl Stream`:
+
+```rust
+#[patina::service]
+pub trait Store: Send + Sync + 'static {
+    async fn get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>, PatinaError>;      // unary
+    async fn scan(&self, range: KeyRange) -> Result<ServerStream<Kv>, PatinaError>; // server-streaming
+}
+```
+
+When the parser sees `ServerStream<T>` as the `Ok` type, it emits streaming code generation:
+
+* **Generated client:** sends one opening `Request`, registers a `Stream` entry in the pending map, and returns a `ServerStream<Kv>` that yields `decode`d chunks and issues `StreamCredit` as the caller consumes.
+* **Generated server:** invokes the user's handler (which returns any `impl Stream<Item = Result<Kv, PatinaError>>`), then spawns a pump that, per item, awaits credit, encodes **one bounded chunk**, and sends a `StreamItem` — followed by a final `StreamEnd`.
+
+This is what dissolves the bottleneck described in §1: each `encode`/`decode` now handles one bounded chunk interleaved with `.await`, so the worker yields between chunks and memory stays flat.
+
+### **6\. Cancellation & Lifecycle**
+
+* **Consumer drop:** if the client drops the stream, an RAII guard (the streaming analogue of the unary `PendingGuard`) sends `StreamCancel { id }` so the server stops producing and frees resources.
+* **Mid-stream error:** a handler error terminates the consumer with `Err` via `StreamError`.
+* **Connection drop:** handled by the extended drain in §3 — every live stream ends with `Closed`.
+
+### **7\. Scope & Phasing**
+
+The full taxonomy is unary (Phases 1–3), **server-streaming**, client-streaming, and bidirectional. Server-streaming (range scans, chunked large reads) and client-streaming (bulk ingest) are the highest-value shapes for CopperDB; server-streaming is the recommended starting point. Suggested order:
+
+1. **Wire:** append the streaming `Envelope` variants.
+2. **Multiplexer:** the `Pending` sum type, reader routing, and a `call_stream` returning `impl Stream` (bounded `mpsc` only — correct but not yet fair across streams).
+3. **Flow control:** credit-based windows (`StreamCredit`) — the fairness layer.
+4. **Macro:** recognize `ServerStream<T>` and generate both sides.
+5. **Later:** client-streaming and bidirectional, reusing the same machinery.
+
+Steps 1, 2, and 4 are largely mechanical given the existing architecture; step 3 carries the real design subtlety. Throughout, the unary path must remain the zero-overhead default — streaming machinery should never tax a simple call.
