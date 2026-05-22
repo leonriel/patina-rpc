@@ -1,0 +1,5 @@
+error: service methods must return `Result<T, PatinaError>`
+ --> tests/ui/bad_return.rs:5:30
+  |
+5 |     async fn wrong(&self) -> i32;
+  |                              ^^^

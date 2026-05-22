@@ -1,0 +1,5 @@
+error: #[patina::service] may only be applied to a trait
+ --> tests/ui/not_a_trait.rs:4:1
+  |
+4 | struct NotATrait;
+  | ^^^^^^

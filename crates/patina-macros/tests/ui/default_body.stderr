@@ -1,0 +1,7 @@
+error: service methods cannot have a default body
+ --> tests/ui/default_body.rs:5:5
+  |
+5 | /     async fn has_body(&self) -> Result<(), PatinaError> {
+6 | |         Ok(())
+7 | |     }
+  | |_____^

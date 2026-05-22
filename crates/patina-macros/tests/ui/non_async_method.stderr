@@ -1,0 +1,5 @@
+error: service methods must be `async`
+ --> tests/ui/non_async_method.rs:5:5
+  |
+5 |     fn not_async(&self) -> Result<(), PatinaError>;
+  |     ^^
