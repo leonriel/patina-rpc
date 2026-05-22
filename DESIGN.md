@@ -58,7 +58,6 @@ TCP is a streaming protocol; it has no concept of message boundaries. To prevent
 
 When a Patina message is transmitted, the exact byte layout on the TCP stream looks like this:
 
-Plaintext
 `+-------------------+---------------------------------------------------+`
 `| Length Prefix     | Serialized Bincode Envelope                       |`
 `| (4 bytes, u32 BE) | (N bytes, variable length)                        |`
@@ -245,6 +244,38 @@ let count \= cache\_client.get\_active\_keys\_count().await?;
 ### **The Resulting Architecture**
 
 By relying on Cargo crates and Rust traits instead of external IDL files, you get cross-team coordination that is validated by the Rust compiler. If Team B ever deletes or changes the signature of an endpoint, Team A's code will fail at compile time (rather than crashing in production) as soon as they update their crate dependency.
+
+## **4\. Safety Boundary: The Positional-Argument Gotcha**
+
+The compile-time contract from §3 is real but bounded, and the boundary is worth stating explicitly. Arguments are serialized **positionally**: the macro encodes a method's parameters as an unnamed tuple — `transfer(&self, from, to, amount)` becomes `encode(&(from, to, amount))` on the client — and the server decodes the mirror tuple type `(AccountId, AccountId, u64)`. Bincode carries no field names (Phase 1 §2), so the wire contract is purely *positional, by arity and type* — nothing else.
+
+That means the compiler catches some signature changes but is **blind to others**:
+
+| Change to a method signature | Caught at compile time? |
+| :---- | :---- |
+| Add or remove a parameter | **Yes** — the tuple's arity changes, so existing call sites fail to compile. |
+| Change a parameter's type | **Yes** — the tuple's element type changes, so call sites fail to compile. |
+| Reorder parameters **of different types** | **Yes** — the tuple type changes (e.g. `(A, B)` → `(B, A)`), so existing call sites no longer type-check. |
+| Reorder parameters **of the same type** | **No** — silent. |
+
+The last row is the gotcha. Consider:
+
+```rust
+// Before
+async fn transfer(&self, from: AccountId, to: AccountId, amount: u64) -> Result<(), PatinaError>;
+// After — `from` and `to` swapped
+async fn transfer(&self, to: AccountId, from: AccountId, amount: u64) -> Result<(), PatinaError>;
+```
+
+Both parameters are `AccountId`, so the serialized tuple type is `(AccountId, AccountId, u64)` either way. Existing call sites like `client.transfer(alice, bob, 100)` still compile cleanly — the types line up — but the server now reads position 0 as `to` and position 1 as `from`. The transfer runs backwards, with **no compiler error and no decode error**. The same trap applies across versions: a client and server built against trait revisions that differ only by a same-type reorder agree on the tuple shape and silently disagree on its meaning.
+
+In short, the macro guarantees **type and arity** safety across the network, not **positional/semantic** safety for interchangeable types — the classic "swapped same-typed arguments" hazard, amplified by crossing a process boundary where there is no shared source to eyeball.
+
+### **Mitigations**
+
+* **Wrap semantically distinct parameters in newtypes.** Giving each role its own type — `struct From(AccountId); struct To(AccountId);` — changes the tuple's element types, so a reorder becomes a compile error the contract *can* see. Newtypes serialize transparently (a newtype encodes as its inner value), so this restores compiler safety at zero wire cost, and is the recommended pattern for any method whose parameters could be confused. Note that wrapping the arguments in an ordinary struct does **not** help: bincode strips field names there too, so a same-type field reorder is just as silent.
+* **Treat parameter reordering as a breaking wire change.** Even when it compiles, reordering parameters is wire-incompatible; it should be versioned and rolled out like any other breaking API change, never filed as a "harmless refactor."
+* **(Future)** A named- or tagged-field argument encoding — matching parameters by name/tag rather than position — would close the gap structurally, but only by moving off bincode's nameless density (Phase 1 §2). Recorded as a possible direction, not a current commitment.
 
 ---
 
