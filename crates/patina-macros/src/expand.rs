@@ -152,7 +152,6 @@ fn expand_server(service: &ServiceTrait) -> TokenStream {
             }
         }
 
-        #[::patina_rpc::__private::async_trait]
         impl<__S> ::patina_rpc::PatinaService for #server_ident<__S>
         where
             __S: #ident + ::core::marker::Send + ::core::marker::Sync + 'static,
