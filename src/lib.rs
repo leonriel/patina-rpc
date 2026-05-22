@@ -23,10 +23,14 @@
 //! # }
 //! ```
 
+pub mod client;
 pub mod codec;
 pub mod envelope;
 pub mod error;
+pub mod server;
 
+pub use client::Client;
 pub use codec::WireCodec;
 pub use envelope::{Envelope, ErrorData, RequestData, ResponseData};
-pub use error::WireError;
+pub use error::{RpcError, WireError};
+pub use server::{handler_fn, Handler, HandlerError, Server, ServerBuilder};
